@@ -1,13 +1,19 @@
 services:
   app.api:
     image: ${DOCKER_REGISTRY-}appapi
+    networks: 
+      - mynetwork
     build:
       context: .
       dockerfile: App.API/Dockerfile
 
   app.ui:
     image: ${DOCKER_REGISTRY-}appui
+    networks: 
+      - mynetwork
     build:
       context: .
       dockerfile: App.UI/Dockerfile
-
+networks: 
+  mynetwork:
+    driver: bridge  
