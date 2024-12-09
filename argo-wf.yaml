@@ -1,0 +1,272 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: cicd
+spec:
+
+  entrypoint: pipelines
+
+  arguments:
+    parameters:
+
+      - name: repo
+        value: http://gitea.example.com/app/app.git
+      - name: branch
+        value: main
+
+      - name: oci-registry
+        value: harbor.example.com
+      - name: oci-image
+        value: app
+      - name: oci-tag
+        value: v1.0.0
+
+  artifactGC:
+    strategy: OnWorkflowDeletion
+
+  podGC:
+    strategy: OnPodCompletion
+
+  ttlStrategy:
+    secondsAfterCompletion: 300
+
+  volumeClaimTemplates:
+    - metadata:
+        name: workdir
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        resources:
+          requests:
+            storage: 640Mi
+
+  templates:
+
+
+    # Create Microservices Pipelines ------------------------------------------------------
+
+    # DAG
+    - name: pipelines
+      dag:
+        tasks:
+
+          - name: clone
+            template: clone
+            arguments:
+              parameters:
+                - name: repo
+                  value: "{{workflow.parameters.repo}}"
+                - name: branch
+                  value: "{{workflow.parameters.branch}}"
+
+          - name: ls
+            template: ls
+            dependencies:
+              - clone
+
+          - name: run-unit-tests
+            dependencies: clone
+            template: unit-tests
+          - name: run-integration-tests
+            dependencies: clone
+            template: integration-tests
+            
+          - name: app.api
+            template: api
+            arguments:
+              parameters:
+                - name: oci-registry
+                  value: "{{workflow.parameters.oci-registry}}"
+                - name: oci-image
+                  value: "{{workflow.parameters.oci-image}}"
+            dependencies:
+              - clone
+
+          - name: app.ui
+            template: ui
+            arguments:
+              parameters:
+                - name: oci-registry
+                  value: "{{workflow.parameters.oci-registry}}"
+                - name: oci-image
+                  value: "{{workflow.parameters.oci-image}}"
+            dependencies:
+              - clone
+          - name: scan-image
+            dependencies: 
+              - api
+              - ui
+            template: trivy-image-scan
+          - name: scan-filesystem
+            dependencies: 
+              - api
+              - ui
+            template: trivy-filesystem-scan
+          - name: push-image
+            dependencies: scan-image
+            template: push-images
+          - name: run-acceptance-tests
+            dependencies: push-image
+            template: acceptance-tests
+
+    # Clone Microservices ------------------------------------------------------
+
+    # Git Clone
+    - name: clone
+      inputs:
+        parameters:
+          - name: repo
+          - name: branch
+      container:
+        volumeMounts:
+          - mountPath: /workdir
+            name: workdir
+        image: alpine/git
+        workingDir: /workdir
+        args:
+          - clone
+          - --depth
+          - "1"
+          - --branch
+          - "{{inputs.parameters.branch}}"
+          - --single-branch
+          - "{{inputs.parameters.repo}}"
+          - .
+
+    # LS
+    - name: ls
+      container:
+        image: alpine
+        command:
+          - sh
+          - -c
+        args:
+          - ls /workdir/tar/;echo "-------LINE-------";ls;
+        workingDir: /workdir
+        volumeMounts:
+          - name: workdir
+            mountPath: /workdir
+
+
+    
+
+    # Build Microservices ------------------------------------------------------
+
+    # API
+    - name: api
+      inputs:
+        parameters:
+          - name: oci-registry
+          - name: oci-image
+      container:
+        image: gcr.io/kaniko-project/executor:latest
+        args:
+          - --context=/workdir
+          - --destination=harbor.example.com/api:latest # "{{workflow.parameters.oci-registry}}/{{workflow.parameters.oci-image}}:latest"
+          - --tar-path=/workdir/tar
+          - --dockerfile=/app.api/Dockerfile
+        workingDir: /workdir
+        volumeMounts:
+          - name: workdir
+            mountPath: /workdir
+        env:
+          - name: DOCKER_CONFIG
+            value: /kaniko/.docker
+      volumes:
+        - name: config-json
+          secret:
+            secretName: config-json
+            defaultMode: 0400
+      
+    # UI
+    - name: ui
+      inputs:
+        parameters:
+          - name: oci-registry
+          - name: oci-image
+      container:
+        image: gcr.io/kaniko-project/executor:latest
+        args:
+          - --context=/workdir
+          - --no-push
+          - --destination=harbor.example.com/ui:latest # "{{workflow.parameters.oci-registry}}/{{workflow.parameters.oci-image}}:latest"
+          - --tar-path=/workdir/.tar
+          - --dockerfile=/app.ui/Dockerfile
+        workingDir: /workdir
+        volumeMounts:
+          - name: workdir
+            mountPath: /workdir
+
+    # Test Microservices ------------------------------------------------------
+    - name: unit-tests
+      container:
+        image: mcr.microsoft.com/dotnet/sdk:8.0
+        command: ["dotnet", "test", "--logger:trx"]
+        args: ["/workdir/App.Test.Integration"]
+
+    - name: integration-tests
+      container:
+        image: mcr.microsoft.com/dotnet/sdk:8.0
+        command: ["dotnet", "test", "--logger:trx"]
+        args: ["/workdir/App.Test.Unit"]
+
+    - name: acceptance-tests
+      container:
+        image: mcr.microsoft.com/dotnet/sdk:8.0
+        command: ["dotnet", "test", "--logger:trx"]
+        args: ["/workdir/App.Test.SystemE2E"]
+
+    # Scan Microservices ------------------------------------------------------
+
+    # Trivy - Image Scan
+    - name: trivy-image-scan
+      container:
+        image: aquasec/trivy
+        args:
+          - image
+          - --input=/workdir/.tar
+        env:
+          - name: DOCKER_HOST
+            value: tcp://127.0.0.1:2375
+        volumeMounts:
+          - name: workdir
+            mountPath: /workdir
+      sidecars:
+        - name: dind
+          image: docker:23.0.1-dind
+          command:
+            - dockerd-entrypoint.sh
+          env:
+            - name: DOCKER_TLS_CERTDIR
+              value: ""
+          securityContext:
+            privileged: true
+          mirrorVolumeMounts: true
+
+    # Trivy - Filesystem Scan
+    - name: trivy-filesystem-scan
+      container:
+        image: aquasec/trivy
+        args:
+          - filesystem
+          - /workdir
+          - --ignorefile=/workdir/.tar
+        volumeMounts:
+          - name: workdir
+            mountPath: /workdir
+
+
+
+    # Push Microservices ------------------------------------------------------
+
+    # Push Images
+    - name: push-images
+      script:
+        image: gcr.io/go-containerregistry/crane:debug
+        command:
+          - sh
+        source: >
+          crane auth login "harbor.example.com" -u "admin" -p "admin" ;
+          crane push /workdir/tar app --insecure ;
+        volumeMounts:
+          - name: workdir
+            mountPath: /workdir 
