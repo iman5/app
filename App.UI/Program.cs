@@ -1,10 +1,11 @@
-using App.UI.Components;
+using App.UI.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
 // Add services to the container.
 builder.Services.AddRazorComponents()
     .AddInteractiveServerComponents();
+builder.Services.AddHttpClient<CustomerService>(client => { client.BaseAddress = new Uri(builder.Configuration["ApiSettings:BaseAddress"]!); });
 
 var app = builder.Build();
 
