@@ -1,0 +1,13 @@
+services:
+  app.api:
+    image: ${DOCKER_REGISTRY-}appapi
+    build:
+      context: .
+      dockerfile: App.API/Dockerfile
+
+  app.ui:
+    image: ${DOCKER_REGISTRY-}appui
+    build:
+      context: .
+      dockerfile: App.UI/Dockerfile
+
